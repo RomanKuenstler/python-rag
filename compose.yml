@@ -99,7 +99,9 @@ services:
         condition: service_healthy
 
   embedder:
-    <<: *node-service
+    build:
+      context: .
+      dockerfile: apps/embedder/Dockerfile
     environment:
       APP_ROLE: embedder
       CONTENT_PATH: /app/data
