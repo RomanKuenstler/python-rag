@@ -6,11 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm \
+    && apt-get install -y --no-install-recommends nodejs npm tesseract-ocr ffmpeg libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json /app/
 RUN npm install
+
+COPY apps/retriever/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY apps /app/apps
 COPY shared /app/shared

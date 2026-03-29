@@ -2404,11 +2404,15 @@ function App() {
     backend: normalizeStatusBadge(statusData?.services?.backend?.role || "active"),
     retriever: retrieverStatus,
     embedder: embedderStatus,
-    ocrScanner: normalizeStatusBadge(statusData?.services?.ocrScanner?.status || statusData?.services?.ocrScanner?.role || "disconnected"),
+    ocrScanner: normalizeStatusBadge(
+      statusData?.services?.ocrScanner?.status
+      || statusData?.services?.ocrScanner?.role
+      || retrieverStatus
+    ),
     audioTranscription: normalizeStatusBadge(
       statusData?.services?.audioTranscription?.status
       || statusData?.services?.audioTranscription?.role
-      || "disconnected"
+      || retrieverStatus
     ),
   };
   const libraryFiles = Array.isArray(filesData?.files) ? filesData.files : [];

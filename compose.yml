@@ -1,48 +1,4 @@
-x-node-service: &node-service
-  build:
-    context: .
-    dockerfile: Dockerfile
-  develop:
-    watch:
-      - action: sync
-        path: ./
-        target: /app
-        initial_sync: true
-        ignore:
-          - node_modules/
-
 services:
-  backend:
-    build:
-      context: .
-      dockerfile: apps/backend/Dockerfile
-    environment:
-      APP_ROLE: backend
-      BACKEND_API_PORT: 3100
-      RETRIEVER_BASE_URL: http://retriever:3000
-      EMBEDDER_BASE_URL: http://embedder:3200
-      AUDIO_TRANSCRIPTION_BASE_URL: http://audio-transcription:3400
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: rag
-      POSTGRES_USER: rag
-      POSTGRES_PASSWORD: rag
-      AUTH_PASSWORD_SALT: xzy132
-      AUTH_USERS_FILE: /app/users.json
-      AUTH_INITIAL_PASSWORD: Passw0rd!
-    volumes:
-      - ./data:/app/data
-      - ./users.json:/app/users.json:ro
-    ports:
-      - "3100:3100"
-    depends_on:
-      retriever:
-        condition: service_started
-      embedder:
-        condition: service_started
-      postgres:
-        condition: service_healthy
-
   retriever:
     build:
       context: .
@@ -71,13 +27,17 @@ services:
       INDEX_STATE_FILE: /app/state/index-state.json
       EMBEDDING_STATUS_FILE: /app/state/embedding-status.json
       RETRIEVER_API_PORT: 3000
-      OCR_SCANNER_BASE_URL: http://ocr-scanner:3300
-      AUDIO_TRANSCRIPTION_BASE_URL: http://audio-transcription:3400
+      BACKEND_API_PORT: 3100
+      OCR_SCANNER_BASE_URL: http://127.0.0.1:3300
+      AUDIO_TRANSCRIPTION_BASE_URL: http://127.0.0.1:3400
     volumes:
       - ./data:/app/data
       - ./upload:/app/upload
       - ./shared/prompts:/app/prompts:ro
+      - ./users.json:/app/users.json:ro
       - rag_state:/app/state
+    ports:
+      - "3100:3100"
     models:
       chat-model:
         endpoint_var: MODEL_RUNNER_BASE_URL
@@ -92,10 +52,6 @@ services:
       qdrant:
         condition: service_started
       embedder:
-        condition: service_started
-      ocr-scanner:
-        condition: service_started
-      audio-transcription:
         condition: service_started
       postgres:
         condition: service_healthy
@@ -120,10 +76,11 @@ services:
       POSTGRES_DB: rag
       POSTGRES_USER: rag
       POSTGRES_PASSWORD: rag
-      OCR_SCANNER_BASE_URL: http://ocr-scanner:3300
-      AUDIO_TRANSCRIPTION_BASE_URL: http://audio-transcription:3400
+      OCR_SCANNER_BASE_URL: http://127.0.0.1:3300
+      AUDIO_TRANSCRIPTION_BASE_URL: http://127.0.0.1:3400
     volumes:
       - ./data:/app/data
+      - ./upload:/app/upload
       - rag_state:/app/state
     models:
       embedding-model:
@@ -135,51 +92,6 @@ services:
     depends_on:
       qdrant:
         condition: service_started
-      ocr-scanner:
-        condition: service_started
-      audio-transcription:
-        condition: service_started
-      postgres:
-        condition: service_healthy
-
-  ocr-scanner:
-    build:
-      context: ./apps/ocr-scanner
-      dockerfile: Dockerfile
-    environment:
-      OCR_API_HOST: 0.0.0.0
-      OCR_API_PORT: 3300
-      OCR_CONTENT_DIR: /app/data
-      OCR_UPLOAD_DIR: /app/upload
-      OCR_PDF_MIN_EXTRACTED_CHARS: 150
-    volumes:
-      - ./data:/app/data
-      - ./upload:/app/upload
-    ports:
-      - "3300:3300"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  audio-transcription:
-    build:
-      context: ./apps/audio-transcription
-      dockerfile: Dockerfile
-    environment:
-      AUDIO_API_HOST: 0.0.0.0
-      AUDIO_API_PORT: 3400
-      AUDIO_CONTENT_DIR: /app/data
-      AUDIO_UPLOAD_DIR: /app/upload
-    volumes:
-      - ./data:/app/data
-      - ./upload:/app/upload
-    ports:
-      - "3400:3400"
-    models:
-      audio-model:
-        endpoint_var: MODEL_RUNNER_BASE_URL
-        model_var: MODEL_RUNNER_LLM_AUDIO
-    depends_on:
       postgres:
         condition: service_healthy
 
@@ -188,7 +100,7 @@ services:
       context: ./apps/webui
       dockerfile: Dockerfile
     environment:
-      UPSTREAM_API_URL: http://backend:3100
+      UPSTREAM_API_URL: http://retriever:3100
     ports:
       - "5173:80"
     develop:
@@ -205,8 +117,7 @@ services:
             - node_modules/
             - dist/
     depends_on:
-      - backend
-
+      - retriever
 
   postgres:
     image: postgres:16-alpine

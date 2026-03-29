@@ -10,16 +10,13 @@ Local, containerized Retrieval-Augmented Generation (RAG) for indexing your own 
 
 ## What this project includes
 
-This stack runs with Docker Compose and ships as multiple focused services:
+This stack runs with Docker Compose and ships as focused services:
 
-- `backend` – frontend-facing API, auth/session handling, admin/user management, managed-library routes.
-- `retriever` – prompt orchestration, retrieval, chat lifecycle, assistant modes, personalization.
-- `embedder` – background indexing + embedding worker for `data/`.
-- `ocr-scanner` – OCR + layout-aware extraction for PDFs/images from library files and prompt uploads.
-- `audio-transcription` – Python transcription microservice for chat and embedding audio jobs.
+- `retriever` – Python-supervised API stack (frontend-facing auth/admin/library API + retriever orchestration + embedded OCR/audio workers).
+- `embedder` – Python-supervised background indexing worker with co-located OCR/audio workers.
 - `qdrant` – vector database for similarity search.
 - `postgres` – persistence for users, sessions, chats, messages, settings, tags, and runtime metadata.
-- `webui` – Vite-bundled React browser UI (Node build -> nginx runtime) with backend API proxying.
+- `webui` – Vite-bundled React browser UI (Node build -> nginx runtime) with retriever API proxying.
 
 ## Quick start
 
@@ -31,17 +28,12 @@ docker compose up -d --build
 
 - Web UI: `http://localhost:5173`
 - Backend API: `http://localhost:3100`
-- Retriever API (internal): `http://retriever:3000`
+- Retriever internal API: `http://retriever:3000`
 - Embedder health endpoint (internal): `http://embedder:3200/internal/embedder/status`
-- OCR scanner API: `http://localhost:3300`
-- Audio transcription API: `http://localhost:3400`
 
 ### Health checks
 
-- Backend: `GET /healthz`
-- Retriever: `GET /healthz`
-- OCR scanner: `GET /healthz`
-- Audio transcription: `GET /healthz`
+- Retriever stack (public API): `GET /healthz`
 - Embedder: `GET /internal/embedder/status`
 
 ## Current feature set
@@ -92,11 +84,11 @@ Current behavior:
 ```text
 .
 ├── apps/
-│   ├── backend/          # frontend-facing API + auth/admin/library integration
-│   ├── retriever/        # retrieval + chat orchestration + assistant behavior
-│   ├── embedder/         # background embedding/index worker + health route
-│   ├── ocr-scanner/      # Python OCR microservice
-│   ├── audio-transcription/ # Python audio transcription microservice
+│   ├── backend/          # shared backend API module (run inside retriever container)
+│   ├── retriever/        # retrieval stack supervisor + chat orchestration + assistant behavior
+│   ├── embedder/         # embedding stack supervisor + background index worker
+│   ├── ocr-scanner/      # Python OCR worker (embedded by retriever/embedder)
+│   ├── audio-transcription/ # Python audio worker (embedded by retriever/embedder)
 │   └── webui/            # React browser client + Vite build + nginx runtime config
 ├── shared/
 │   ├── src/              # reusable runtime modules
@@ -124,5 +116,5 @@ Current behavior:
 ```bash
 npm run lint
 node --check apps/webui/app.js apps/webui/panel-content.js apps/webui/utils.js apps/webui/chat-export.js apps/webui/api-client.js apps/webui/app-shared.js
-node --check apps/retriever/api.js apps/retriever/cli.js apps/retriever/ui.js apps/retriever/ui-helpers.js apps/backend/api.js apps/backend/library-service.js apps/backend/request-dispatcher.js apps/backend/user-bootstrap.js apps/embedder/worker.js apps/embedder/health-server.js
+node --check apps/retriever/api.js apps/retriever/cli.js apps/retriever/ui.js apps/retriever/ui-helpers.js apps/embedder/worker.js apps/embedder/health-server.js
 ```

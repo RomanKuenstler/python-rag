@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm \
+    && apt-get install -y --no-install-recommends nodejs npm tesseract-ocr ffmpeg libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json /app/
@@ -23,4 +23,4 @@ RUN groupadd --gid 1001 nodejs && useradd --uid 1001 --gid nodejs --shell /bin/b
 RUN mkdir -p /app/state && chown -R ai:nodejs /app
 USER ai
 
-CMD ["python", "-m", "apps.embedder.worker"]
+CMD ["python", "-m", "apps.embedder.runner"]

@@ -498,7 +498,7 @@ export function renderPanelContent({
         key: "backend",
         label: "backend",
         status: serviceStatuses.backend || "active",
-        description: "Web API gateway handling authentication, sessions, and orchestration.",
+        description: "Public API gateway for authentication, sessions, and orchestration.",
       },
       {
         key: "retriever",
@@ -516,13 +516,13 @@ export function renderPanelContent({
         key: "ocr-scanner",
         label: "ocr scanner",
         status: serviceStatuses.ocrScanner || "disconnected",
-        description: "Extracts text from scanned PDFs and images for retrieval and embedding.",
+        description: "Embedded OCR worker used by retriever/embedder for PDF and image text extraction.",
       },
       {
         key: "audio-transcription",
         label: "audio transcription",
         status: serviceStatuses.audioTranscription || "disconnected",
-        description: "Transcribes uploaded/library audio into text for embedding and chat workflows.",
+        description: "Embedded audio worker used by retriever/embedder for transcription workflows.",
       },
       {
         key: "vector-db",
