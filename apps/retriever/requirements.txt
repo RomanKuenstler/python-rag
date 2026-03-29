@@ -1,0 +1,1 @@
+# intentionally minimal: retriever runtime logic remains in Node subprocess

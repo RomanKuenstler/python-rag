@@ -44,7 +44,9 @@ services:
         condition: service_healthy
 
   retriever:
-    <<: *node-service
+    build:
+      context: .
+      dockerfile: apps/retriever/Dockerfile
     environment:
       APP_ROLE: retriever
       TERM: xterm-256color
