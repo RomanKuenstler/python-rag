@@ -7,8 +7,8 @@ import sys
 import time
 from dataclasses import dataclass
 
-RESTART_DELAY_SECONDS = float(os.getenv("RETRIEVER_RESTART_DELAY_SECONDS", "2"))
-MAX_CRASH_RESTARTS = int(os.getenv("RETRIEVER_MAX_CRASH_RESTARTS", "0"))  # 0 = unlimited
+RESTART_DELAY_SECONDS = float(os.getenv("EMBEDDER_RESTART_DELAY_SECONDS", "2"))
+MAX_CRASH_RESTARTS = int(os.getenv("EMBEDDER_MAX_CRASH_RESTARTS", "0"))  # 0 = unlimited
 
 
 @dataclass
@@ -25,16 +25,9 @@ stop_requested = False
 def _build_processes() -> list[ManagedProcess]:
     base_env = os.environ.copy()
 
-    retriever_env = base_env.copy()
-    retriever_env.setdefault("RETRIEVER_API_PORT", "3000")
-    retriever_env.setdefault("OCR_SCANNER_BASE_URL", "http://127.0.0.1:3300")
-    retriever_env.setdefault("AUDIO_TRANSCRIPTION_BASE_URL", "http://127.0.0.1:3400")
-
-    backend_env = base_env.copy()
-    backend_env.setdefault("BACKEND_API_PORT", "3100")
-    backend_env.setdefault("RETRIEVER_BASE_URL", "http://127.0.0.1:3000")
-    backend_env.setdefault("OCR_SCANNER_BASE_URL", "http://127.0.0.1:3300")
-    backend_env.setdefault("AUDIO_TRANSCRIPTION_BASE_URL", "http://127.0.0.1:3400")
+    embedder_env = base_env.copy()
+    embedder_env.setdefault("OCR_SCANNER_BASE_URL", "http://127.0.0.1:3300")
+    embedder_env.setdefault("AUDIO_TRANSCRIPTION_BASE_URL", "http://127.0.0.1:3400")
 
     ocr_env = base_env.copy()
     ocr_env.setdefault("OCR_API_PORT", "3300")
@@ -43,8 +36,7 @@ def _build_processes() -> list[ManagedProcess]:
     audio_env.setdefault("AUDIO_API_PORT", "3400")
 
     return [
-        ManagedProcess(name="retriever-node", cmd=["node", "apps/retriever/api.js"], env=retriever_env),
-        ManagedProcess(name="backend-api", cmd=["python", "-m", "apps.backend.api"], env=backend_env),
+        ManagedProcess(name="embedder-worker", cmd=["python", "-m", "apps.embedder.worker"], env=embedder_env),
         ManagedProcess(name="ocr-scanner", cmd=["python", "apps/ocr-scanner/worker.py"], env=ocr_env),
         ManagedProcess(name="audio-transcription", cmd=["python", "apps/audio-transcription/worker.py"], env=audio_env),
     ]
@@ -82,7 +74,7 @@ def _handle_signal(signum, _frame):
 def _run_once() -> int:
     processes = _build_processes()
     for managed in processes:
-        print(f"[retriever-python] starting {managed.name}: {' '.join(managed.cmd)}", flush=True)
+        print(f"[embedder-python] starting {managed.name}: {' '.join(managed.cmd)}", flush=True)
         managed.proc = subprocess.Popen(managed.cmd, env=managed.env)
 
     try:
@@ -94,7 +86,7 @@ def _run_once() -> int:
                 exit_code = proc.poll()
                 if exit_code is not None:
                     print(
-                        f"[retriever-python] process {managed.name} exited with code {exit_code}; stopping stack.",
+                        f"[embedder-python] process {managed.name} exited with code {exit_code}; stopping stack.",
                         flush=True,
                     )
                     _terminate_all(processes)
@@ -119,11 +111,11 @@ def run_forever() -> int:
 
         crash_count += 1
         if MAX_CRASH_RESTARTS > 0 and crash_count >= MAX_CRASH_RESTARTS:
-            print("[retriever-python] max crash restarts reached; exiting.", flush=True)
+            print("[embedder-python] max crash restarts reached; exiting.", flush=True)
             return exit_code
 
         print(
-            f"[retriever-python] stack crashed with exit code {exit_code}; restarting in {RESTART_DELAY_SECONDS}s.",
+            f"[embedder-python] stack crashed with exit code {exit_code}; restarting in {RESTART_DELAY_SECONDS}s.",
             flush=True,
         )
         time.sleep(RESTART_DELAY_SECONDS)
