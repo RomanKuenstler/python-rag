@@ -1,0 +1,1043 @@
+import { dbQuery, ensureDatabaseReady, pingDatabase } from "../../shared/db/index.js";
+import http from "http";
+import crypto from "crypto";
+import {
+  deleteManagedLibraryFileForUser,
+  listManagedLibraryFiles,
+  saveManagedLibraryFile,
+  toggleManagedLibraryFile,
+} from "./library-service.js";
+import { syncUsersFromConfigFile } from "./user-bootstrap.js";
+import { createBackendRequestHandler } from "./request-dispatcher.js";
+import { getGlobalPasswordSalt, hashPasswordWithGlobalSalt, hashPasswordWithSalt } from "../../shared/src/auth.js";
+
+const MAX_LIBRARY_UPLOAD_FILES_PER_REQUEST = 5;
+const SESSION_INITIAL_TTL_MS = 2 * 60 * 60 * 1000;
+const SESSION_REFRESH_THRESHOLD_MS = SESSION_INITIAL_TTL_MS / 2;
+const SESSION_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
+const PORT = parseInt(process.env.BACKEND_API_PORT || "3100", 10);
+const HOST = process.env.BACKEND_API_HOST || "0.0.0.0";
+const RETRIEVER_BASE_URL = process.env.RETRIEVER_BASE_URL || "http://retriever:3000";
+const EMBEDDER_BASE_URL = process.env.EMBEDDER_BASE_URL || "http://embedder:3200";
+const OCR_SCANNER_BASE_URL = process.env.OCR_SCANNER_BASE_URL || "http://ocr-scanner:3300";
+const AUDIO_TRANSCRIPTION_BASE_URL =
+  process.env.AUDIO_TRANSCRIPTION_BASE_URL || "http://audio-transcription:3400";
+const MAX_API_BODY_BYTES = Number.parseInt(process.env.MAX_API_BODY_BYTES || String(25 * 1024 * 1024), 10);
+const ADMIN_EDIT_PROTECTED_USERNAMES = new Set(["default", "defaultadm"]);
+
+function json(res, statusCode, payload) {
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Session-Token",
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function hashSessionToken(token) {
+  return crypto.createHash("sha256").update(`${getGlobalPasswordSalt()}:${String(token || "")}`).digest("hex");
+}
+
+function buildSessionWindow(now = new Date()) {
+  const createdAt = new Date(now);
+  const maxExpiresAt = new Date(createdAt.getTime() + SESSION_MAX_LIFETIME_MS);
+  const expiresAt = new Date(Math.min(createdAt.getTime() + SESSION_INITIAL_TTL_MS, maxExpiresAt.getTime()));
+  return { createdAt, expiresAt, maxExpiresAt };
+}
+
+async function createOrReplaceSession({ userId, sessionId }) {
+  const now = new Date();
+  const { createdAt, expiresAt, maxExpiresAt } = buildSessionWindow(now);
+  const sessionToken = crypto.randomUUID();
+  const sessionTokenHash = hashSessionToken(sessionToken);
+
+  await dbQuery(
+    `INSERT INTO sessions (user_id, session_identifier, session_token_hash, created_at, expires_at)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (session_identifier) DO UPDATE
+       SET user_id = EXCLUDED.user_id,
+           session_token_hash = EXCLUDED.session_token_hash,
+           created_at = EXCLUDED.created_at,
+           expires_at = EXCLUDED.expires_at`,
+    [userId, sessionId, sessionTokenHash, createdAt.toISOString(), expiresAt.toISOString()]
+  );
+
+  return {
+    sessionId,
+    sessionToken,
+    createdAt: createdAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    maxExpiresAt: maxExpiresAt.toISOString(),
+  };
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let sizeBytes = 0;
+
+    req.on("data", (chunk) => {
+      sizeBytes += chunk.length;
+      if (sizeBytes > MAX_API_BODY_BYTES) {
+        reject(new Error("Payload too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", reject);
+  });
+}
+
+function isJsonContentType(contentType) {
+  return String(contentType || "").toLowerCase().includes("application/json");
+}
+
+async function proxyRetriever({ req, res, targetPath, sessionId }) {
+  const method = req.method || "GET";
+  const targetUrl = new URL(`${RETRIEVER_BASE_URL}${targetPath}`);
+  if (sessionId) {
+    targetUrl.searchParams.set("sessionId", sessionId);
+  }
+  const contentType = String(req.headers["content-type"] || "application/json");
+  let body = undefined;
+  if (["POST", "PATCH", "DELETE"].includes(method)) {
+    const rawBody = await readBody(req);
+    if (sessionId && rawBody && isJsonContentType(contentType)) {
+      try {
+        const parsed = JSON.parse(rawBody);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          body = JSON.stringify({
+            ...parsed,
+            sessionId,
+          });
+        } else {
+          body = rawBody;
+        }
+      } catch {
+        body = rawBody;
+      }
+    } else if (sessionId && !rawBody && isJsonContentType(contentType)) {
+      body = JSON.stringify({ sessionId });
+    } else {
+      body = rawBody;
+    }
+  }
+
+  const upstreamResponse = await fetch(targetUrl, {
+    method,
+    headers: {
+      "content-type": contentType,
+    },
+    body,
+  });
+
+  const text = await upstreamResponse.text();
+  const upstreamContentType = upstreamResponse.headers.get("content-type") || "application/json";
+
+  res.writeHead(upstreamResponse.status, {
+    "Content-Type": upstreamContentType,
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Session-Token",
+  });
+  res.end(text);
+}
+
+async function fetchJson(url) {
+  const response = await fetch(url);
+  const text = await response.text();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function getSessionIdFromRequest(url, body = null) {
+  const fromQuery = String(url.searchParams.get("sessionId") || "").trim();
+  if (fromQuery) return fromQuery;
+  const fromBody = String(body?.sessionId || "").trim();
+  return fromBody;
+}
+
+async function validateAndRefreshSession({ req, url, body = null, refresh = true }) {
+  const requestedSessionId = getSessionIdFromRequest(url, body);
+  const sessionToken = String(req.headers["x-session-token"] || "").trim();
+  if (!sessionToken) {
+    return { ok: false, statusCode: 401, error: "Missing session token." };
+  }
+  const expectedTokenHash = hashSessionToken(sessionToken);
+
+  const result = requestedSessionId
+    ? await dbQuery(
+      `SELECT s.user_id, s.session_identifier, s.session_token_hash, s.created_at, s.expires_at, u.username, u.display_name, u.role
+       FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.session_identifier = $1
+       LIMIT 1`,
+      [requestedSessionId]
+    )
+    : await dbQuery(
+      `SELECT s.user_id, s.session_identifier, s.session_token_hash, s.created_at, s.expires_at, u.username, u.display_name, u.role
+       FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.session_token_hash = $1
+       LIMIT 1`,
+      [expectedTokenHash]
+    );
+  const session = result.rows[0];
+  if (!session || !session.session_token_hash) {
+    return { ok: false, statusCode: 401, error: "Session not found." };
+  }
+  const resolvedSessionId = String(session.session_identifier || "").trim();
+
+  if (expectedTokenHash !== session.session_token_hash) {
+    return { ok: false, statusCode: 401, error: "Session token is invalid." };
+  }
+
+  const nowMs = Date.now();
+  const createdMs = new Date(session.created_at).getTime();
+  const expiresMs = session.expires_at ? new Date(session.expires_at).getTime() : 0;
+  const maxExpiresMs = createdMs + SESSION_MAX_LIFETIME_MS;
+
+  if (nowMs >= maxExpiresMs) {
+    await dbQuery("DELETE FROM sessions WHERE session_identifier = $1", [resolvedSessionId]);
+    return { ok: false, statusCode: 401, error: "Session reached its maximum lifetime. Please log in again." };
+  }
+
+  if (!expiresMs || nowMs >= expiresMs) {
+    await dbQuery("DELETE FROM sessions WHERE session_identifier = $1", [resolvedSessionId]);
+    return { ok: false, statusCode: 401, error: "Session expired. Please log in again." };
+  }
+
+  let nextExpiresAt = new Date(expiresMs).toISOString();
+  if (refresh && (expiresMs - nowMs) <= SESSION_REFRESH_THRESHOLD_MS) {
+    const refreshedMs = Math.min(nowMs + SESSION_INITIAL_TTL_MS, maxExpiresMs);
+    if (refreshedMs > expiresMs) {
+      nextExpiresAt = new Date(refreshedMs).toISOString();
+      await dbQuery(
+        `UPDATE sessions
+         SET expires_at = $2
+         WHERE session_identifier = $1`,
+        [resolvedSessionId, nextExpiresAt]
+      );
+    }
+  }
+
+  return {
+    ok: true,
+    session: {
+      userId: Number.parseInt(String(session.user_id || ""), 10),
+      sessionId: resolvedSessionId,
+      username: session.username,
+      displayName: session.display_name,
+      role: session.role,
+      createdAt: new Date(createdMs).toISOString(),
+      expiresAt: nextExpiresAt,
+      maxExpiresAt: new Date(maxExpiresMs).toISOString(),
+    },
+  };
+}
+
+async function handleStatus(req, res, sessionId) {
+  const retrieverStatusUrl = `${RETRIEVER_BASE_URL}/internal/retriever/status?sessionId=${encodeURIComponent(sessionId)}`;
+  const retrieverStatusPromise = fetchJson(retrieverStatusUrl);
+  const embedderStatusPromise = fetchJson(`${EMBEDDER_BASE_URL}/internal/embedder/status`).catch(() => null);
+  const ocrScannerStatusPromise = fetchJson(`${OCR_SCANNER_BASE_URL}/healthz`).catch(() => null);
+  const audioTranscriptionStatusPromise = fetchJson(`${AUDIO_TRANSCRIPTION_BASE_URL}/healthz`).catch(() => null);
+
+  const [retrieverStatus, embedderStatus, ocrScannerStatus, audioTranscriptionStatus] = await Promise.all([
+    retrieverStatusPromise,
+    embedderStatusPromise,
+    ocrScannerStatusPromise,
+    audioTranscriptionStatusPromise,
+  ]);
+  const responsePayload = {
+    ...(retrieverStatus || {}),
+    orchestration: {
+      entrypoint: "backend-api",
+      version: "v1",
+    },
+    services: {
+      backend: {
+        role: "backend-api",
+        baseUrl: `http://${HOST}:${PORT}`,
+      },
+      retriever: {
+        role: retrieverStatus?.app?.role || "retriever-api",
+        baseUrl: RETRIEVER_BASE_URL,
+      },
+      embedder: {
+        role: embedderStatus?.service || "embedder",
+        baseUrl: EMBEDDER_BASE_URL,
+        status: embedderStatus,
+      },
+      ocrScanner: {
+        role: ocrScannerStatus?.service || "ocr-scanner",
+        baseUrl: OCR_SCANNER_BASE_URL,
+        status: ocrScannerStatus?.status || (ocrScannerStatus ? "active" : "disconnected"),
+      },
+      audioTranscription: {
+        role: audioTranscriptionStatus?.service || "audio-transcription",
+        baseUrl: AUDIO_TRANSCRIPTION_BASE_URL,
+        status: audioTranscriptionStatus?.status || (audioTranscriptionStatus ? "active" : "disconnected"),
+      },
+    },
+  };
+
+  if (embedderStatus?.embeddingStatus) {
+    responsePayload.embedding = {
+      ...(responsePayload.embedding || {}),
+      workerStatus: embedderStatus.embeddingStatus,
+    };
+  }
+
+  json(res, 200, responsePayload);
+}
+
+async function getDbHealth() {
+  try {
+    await pingDatabase();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+async function handleLibraryUpload(req, res, session) {
+  if (!Number.isInteger(session?.userId) || session.userId <= 0) {
+    json(res, 401, { ok: false, error: "Invalid session user." });
+    return;
+  }
+  const isAdmin = String(session?.role || "").trim().toLowerCase() === "admin";
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  try {
+    const rawFiles = Array.isArray(body.files)
+      ? body.files
+      : (body.name || body.contentBase64)
+        ? [{
+          name: body.name,
+          contentBase64: body.contentBase64,
+          overwrite: body.overwrite,
+          tags: body.tags,
+        }]
+        : [];
+
+    if (rawFiles.length === 0) {
+      json(res, 400, { ok: false, error: "No files provided." });
+      return;
+    }
+
+    if (rawFiles.length > MAX_LIBRARY_UPLOAD_FILES_PER_REQUEST) {
+      json(res, 400, {
+        ok: false,
+        error: `Please upload up to ${MAX_LIBRARY_UPLOAD_FILES_PER_REQUEST} files per request.`,
+      });
+      return;
+    }
+
+    const uploadResults = await Promise.all(rawFiles.map(async (entry) => {
+      try {
+        const file = await saveManagedLibraryFile({
+          fileName: entry?.name,
+          contentBase64: entry?.contentBase64,
+          overwrite: Boolean(entry?.overwrite),
+          tags: entry?.tags,
+          uploadedByUserId: session.userId,
+          saveToRoot: isAdmin,
+        });
+        return { ok: true, fileName: entry?.name, file };
+      } catch (error) {
+        return { ok: false, fileName: entry?.name, error: error.message };
+      }
+    }));
+
+    const statusCode = uploadResults.every((result) => result.ok)
+      ? 201
+      : uploadResults.some((result) => result.ok)
+        ? 207
+        : 400;
+
+    json(res, statusCode, {
+      ok: uploadResults.every((result) => result.ok),
+      files: uploadResults,
+    });
+  } catch (error) {
+    if (error.message === "Payload too large") {
+      json(res, 413, { ok: false, error: error.message });
+      return;
+    }
+    const statusCode = error.message === "File already exists." ? 409 : 400;
+    json(res, statusCode, { ok: false, error: error.message });
+  }
+}
+
+async function handleLibraryDelete(url, res, session) {
+  const filePath = String(url.searchParams.get("path") || "");
+  if (!filePath) {
+    json(res, 400, { ok: false, error: "Missing 'path' query parameter." });
+    return;
+  }
+
+  const isAdmin = String(session?.role || "").trim().toLowerCase() === "admin";
+  const result = await deleteManagedLibraryFileForUser(filePath, { userId: session.userId, isAdmin });
+  if (!result.deleted) {
+    if (result.reason === "not_owner") {
+      json(res, 403, { ok: false, error: "You can only delete files that you uploaded." });
+      return;
+    }
+    json(res, 404, { ok: false, error: "Managed file not found." });
+    return;
+  }
+
+  json(res, 200, { ok: true, path: result.path, removedVectors: result.removedVectors ?? null });
+}
+
+async function handleLibraryToggle(req, res, session) {
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  const filePath = String(body.path || "");
+  const action = String(body.action || "").toLowerCase();
+  if (!filePath) {
+    json(res, 400, { ok: false, error: "Missing 'path' in request body." });
+    return;
+  }
+  if (!["disable", "activate"].includes(action)) {
+    json(res, 400, { ok: false, error: "Action must be either 'disable' or 'activate'." });
+    return;
+  }
+
+  const result = await toggleManagedLibraryFile(filePath, action === "activate", { userId: session.userId });
+  if (!result.updated) {
+    json(res, 404, { ok: false, error: "Managed file not found for this user." });
+    return;
+  }
+  json(res, 200, { ok: true, file: result });
+}
+
+async function handleLibraryList(res, session) {
+  const isAdmin = String(session?.role || "").trim().toLowerCase() === "admin";
+  const files = await listManagedLibraryFiles({ userId: session.userId, isAdmin });
+  json(res, 200, {
+    ok: true,
+    files,
+    total: files.length,
+    ready: files.filter((file) => file.uploadStatus === "ready").length,
+    embedding: files.filter((file) => file.uploadStatus === "embedding").length,
+    error: files.filter((file) => file.uploadStatus === "error").length,
+  });
+}
+
+const CHAT_INPUT_AUDIO_EXTENSIONS = new Set(["wav", "mp3", "m4a", "webm"]);
+const CHAT_INPUT_TRANSCRIPTION_MODES = new Set(["translate", "transcribe"]);
+const PROMPT_AUDIO_ATTACHMENT_EXTENSIONS = new Set([".wav", ".mp3", ".m4a", ".webm"]);
+
+async function handleChatInputTranscription(req, res, _session) {
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  const audioBase64 = String(body?.audioBase64 || "").trim();
+  const requestedExtension = String(body?.audioExtension || "").trim().toLowerCase().replace(/^\./, "");
+  const requestedTranscriptionMode = String(body?.transcriptionMode || "").trim().toLowerCase();
+  const audioExtension = CHAT_INPUT_AUDIO_EXTENSIONS.has(requestedExtension) ? requestedExtension : "wav";
+  const transcriptionMode = CHAT_INPUT_TRANSCRIPTION_MODES.has(requestedTranscriptionMode)
+    ? requestedTranscriptionMode
+    : "translate";
+  if (!audioBase64) {
+    json(res, 400, { ok: false, error: "Missing audioBase64 payload." });
+    return;
+  }
+
+  const upstreamResponse = await fetch(`${AUDIO_TRANSCRIPTION_BASE_URL}/audio/transcribe`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      request_type: "chat_input",
+      audio_base64: audioBase64,
+      audio_extension: audioExtension,
+      transcription_mode: transcriptionMode,
+    }),
+  });
+
+  const payloadText = await upstreamResponse.text();
+  let payload;
+  try {
+    payload = payloadText ? JSON.parse(payloadText) : {};
+  } catch {
+    payload = { ok: false, error: "Invalid transcription response payload." };
+  }
+
+  if (!upstreamResponse.ok || payload?.ok !== true) {
+    json(res, upstreamResponse.status || 502, {
+      ok: false,
+      error: payload?.error || `Audio transcription failed (${upstreamResponse.status})`,
+      errorCode: payload?.error_code || "transcription_failed",
+    });
+    return;
+  }
+
+  const transcribedText = typeof payload?.transcription?.text === "string"
+    ? payload.transcription.text.trim()
+    : "";
+  json(res, 200, {
+    ok: true,
+    transcription: {
+      text: transcribedText,
+      detectedLanguage: payload?.transcription?.detected_language || "unknown",
+      durationSeconds: payload?.transcription?.duration_seconds ?? null,
+      mode: payload?.transcription?.mode || transcriptionMode,
+    },
+  });
+}
+
+function getFileExtensionFromName(fileName) {
+  const normalized = String(fileName || "").trim().toLowerCase();
+  if (!normalized.includes(".")) return "";
+  return `.${normalized.split(".").pop() || ""}`;
+}
+
+function toAudioExtensionPayload(extension) {
+  return String(extension || "").replace(/^\./, "").toLowerCase();
+}
+
+async function transcribePromptAudioAttachment(file) {
+  const rawName = String(file?.name || "").trim();
+  const extension = getFileExtensionFromName(rawName);
+  if (!PROMPT_AUDIO_ATTACHMENT_EXTENSIONS.has(extension)) {
+    return { ok: true, file };
+  }
+
+  const audioBase64 = typeof file?.contentBase64 === "string" ? file.contentBase64.trim() : "";
+  if (!audioBase64) {
+    return { ok: false, error: `Missing audio payload for attachment ${rawName || "unknown"}.` };
+  }
+
+  const upstreamResponse = await fetch(`${AUDIO_TRANSCRIPTION_BASE_URL}/audio/transcribe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      request_type: "user_attach",
+      audio_base64: audioBase64,
+      audio_extension: toAudioExtensionPayload(extension),
+      transcription_mode: "translate",
+    }),
+  });
+
+  const payloadText = await upstreamResponse.text();
+  let payload;
+  try {
+    payload = payloadText ? JSON.parse(payloadText) : {};
+  } catch {
+    payload = { ok: false, error: "Invalid transcription response payload." };
+  }
+
+  if (!upstreamResponse.ok || payload?.ok !== true) {
+    return {
+      ok: false,
+      error: payload?.error || `Audio transcription failed (${upstreamResponse.status})`,
+    };
+  }
+
+  const transcriptionText = typeof payload?.transcription?.text === "string"
+    ? payload.transcription.text.trim()
+    : "";
+  if (!transcriptionText) {
+    return { ok: false, error: `No text detected in audio attachment ${rawName || "unknown"}.` };
+  }
+
+  return {
+    ok: true,
+    file: {
+      name: `${rawName}.transcription.txt`,
+      content: transcriptionText,
+    },
+  };
+}
+
+async function handlePromptWithUserAttachments(req, res, session) {
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  const uploadedFiles = Array.isArray(body?.uploadedFiles) ? body.uploadedFiles : [];
+  const normalizedUploadedFiles = [];
+  for (const file of uploadedFiles) {
+    const normalized = await transcribePromptAudioAttachment(file);
+    if (!normalized.ok) {
+      json(res, 400, { ok: false, error: normalized.error || "Audio attachment transcription failed." });
+      return;
+    }
+    normalizedUploadedFiles.push(normalized.file);
+  }
+
+  const upstreamResponse = await fetch(`${RETRIEVER_BASE_URL}/internal/retriever/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      ...body,
+      uploadedFiles: normalizedUploadedFiles,
+      sessionId: session.sessionId,
+    }),
+  });
+
+  const text = await upstreamResponse.text();
+  const upstreamContentType = upstreamResponse.headers.get("content-type") || "application/json";
+  res.writeHead(upstreamResponse.status, {
+    "Content-Type": upstreamContentType,
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Session-Token",
+  });
+  res.end(text);
+}
+
+async function handleLogin(req, res, url) {
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  const username = String(body?.username || "").trim();
+  const password = String(body?.password || "");
+  const sessionId = getSessionIdFromRequest(url, body);
+  if (!username || !password) {
+    json(res, 400, { ok: false, error: "Username and password are required." });
+    return;
+  }
+  if (!sessionId) {
+    json(res, 400, { ok: false, error: "Session id is required." });
+    return;
+  }
+
+  const userResult = await dbQuery(
+    `SELECT id, username, display_name, password_hash, password_salt, role, is_active, require_changepw
+     FROM users
+     WHERE username = $1
+     LIMIT 1`,
+    [username]
+  );
+  const user = userResult.rows[0];
+  if (!user) {
+    json(res, 404, { ok: false, error: "User does not exist." });
+    return;
+  }
+  if (!user.is_active) {
+    json(res, 403, { ok: false, error: "User account is inactive." });
+    return;
+  }
+
+  const enteredPasswordHash = hashPasswordWithSalt(password, user.password_salt);
+  if (enteredPasswordHash !== user.password_hash) {
+    json(res, 401, { ok: false, error: "Invalid password." });
+    return;
+  }
+
+  if (user.require_changepw) {
+    json(res, 200, {
+      ok: true,
+      requirePasswordChange: true,
+      user: {
+        id: user.id,
+        username: user.username,
+        displayName: user.display_name,
+        role: user.role,
+      },
+    });
+    return;
+  }
+
+  const session = await createOrReplaceSession({ userId: user.id, sessionId });
+  json(res, 200, {
+    ok: true,
+    requirePasswordChange: false,
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.display_name,
+      role: user.role,
+    },
+    session,
+  });
+}
+
+async function handleChangePassword(req, res, url) {
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  const username = String(body?.username || "").trim();
+  const oldPassword = String(body?.oldPassword || "");
+  const newPassword = String(body?.newPassword || "");
+  const confirmNewPassword = String(body?.confirmNewPassword || "");
+  const sessionId = getSessionIdFromRequest(url, body);
+  if (!username || !oldPassword || !newPassword || !confirmNewPassword) {
+    json(res, 400, { ok: false, error: "All fields are required." });
+    return;
+  }
+  if (!sessionId) {
+    json(res, 400, { ok: false, error: "Session id is required." });
+    return;
+  }
+  if (newPassword !== confirmNewPassword) {
+    json(res, 400, { ok: false, error: "New password and confirmation do not match." });
+    return;
+  }
+
+  const userResult = await dbQuery(
+    `SELECT id, username, display_name, password_hash, password_salt, role, is_active
+     FROM users
+     WHERE username = $1
+     LIMIT 1`,
+    [username]
+  );
+  const user = userResult.rows[0];
+  if (!user) {
+    json(res, 404, { ok: false, error: "User does not exist." });
+    return;
+  }
+  if (!user.is_active) {
+    json(res, 403, { ok: false, error: "User account is inactive." });
+    return;
+  }
+
+  const enteredOldPasswordHash = hashPasswordWithSalt(oldPassword, user.password_salt);
+  if (enteredOldPasswordHash !== user.password_hash) {
+    json(res, 401, { ok: false, error: "Old password is invalid." });
+    return;
+  }
+
+  const newPasswordHash = hashPasswordWithGlobalSalt(newPassword);
+  const globalSalt = getGlobalPasswordSalt();
+  await dbQuery(
+    `UPDATE users
+     SET password_hash = $1,
+         password_salt = $2,
+         require_changepw = FALSE,
+         updated_at = NOW()
+     WHERE id = $3`,
+    [newPasswordHash, globalSalt, user.id]
+  );
+
+  const session = await createOrReplaceSession({ userId: user.id, sessionId });
+  json(res, 200, {
+    ok: true,
+    requirePasswordChange: false,
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.display_name,
+      role: user.role,
+    },
+    session,
+  });
+}
+
+async function handleSession(req, res, url) {
+  const validation = await validateAndRefreshSession({ req, url, refresh: true });
+  if (!validation.ok) {
+    json(res, validation.statusCode || 401, { ok: false, error: validation.error });
+    return;
+  }
+
+  json(res, 200, {
+    ok: true,
+    user: {
+      username: validation.session.username,
+      displayName: validation.session.displayName,
+      role: validation.session.role,
+    },
+    session: {
+      sessionId: validation.session.sessionId,
+      createdAt: validation.session.createdAt,
+      expiresAt: validation.session.expiresAt,
+      maxExpiresAt: validation.session.maxExpiresAt,
+    },
+  });
+}
+
+async function handleLogout(req, res, url) {
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  const validation = await validateAndRefreshSession({ req, url, body, refresh: false });
+  if (!validation.ok) {
+    json(res, validation.statusCode || 401, { ok: false, error: validation.error });
+    return;
+  }
+
+  await dbQuery("DELETE FROM sessions WHERE session_identifier = $1", [validation.session.sessionId]);
+  json(res, 200, { ok: true, loggedOut: true });
+}
+
+function isAdminSession(session) {
+  return String(session?.role || "").trim().toLowerCase() === "admin";
+}
+
+function normalizeUserRole(input) {
+  return String(input || "").trim().toLowerCase() === "admin" ? "admin" : "users";
+}
+
+async function handleAdminUsersList(res) {
+  const result = await dbQuery(
+    `SELECT username, is_active, require_changepw
+     FROM users
+     ORDER BY username ASC`
+  );
+  const users = result.rows.map((row) => ({
+    username: row.username,
+    isActive: Boolean(row.is_active),
+    requireChangePw: Boolean(row.require_changepw),
+  }));
+  json(res, 200, { ok: true, users });
+}
+
+async function handleAdminUserCreate(req, res) {
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  const username = String(body?.username || "").trim();
+  const displayName = String(body?.displayName || "").trim();
+  const role = normalizeUserRole(body?.role);
+  if (username.length < 4 || displayName.length < 2) {
+    json(res, 400, { ok: false, error: "Username or display name is too short." });
+    return;
+  }
+  if (ADMIN_EDIT_PROTECTED_USERNAMES.has(username)) {
+    json(res, 400, { ok: false, error: "This username is reserved." });
+    return;
+  }
+
+  const passwordHash = hashPasswordWithGlobalSalt(process.env.AUTH_INITIAL_PASSWORD || "Passw0rd!");
+  const passwordSalt = getGlobalPasswordSalt();
+  try {
+    const result = await dbQuery(
+      `INSERT INTO users (username, display_name, password_hash, password_salt, role, is_active, require_changepw, updated_at)
+       VALUES ($1, $2, $3, $4, $5, TRUE, TRUE, NOW())
+       RETURNING username, display_name, role, is_active, require_changepw`,
+      [username, displayName, passwordHash, passwordSalt, role]
+    );
+    const created = result.rows[0];
+    json(res, 201, {
+      ok: true,
+      user: {
+        username: created.username,
+        displayName: created.display_name,
+        role: created.role,
+        isActive: Boolean(created.is_active),
+        requireChangePw: Boolean(created.require_changepw),
+      },
+    });
+  } catch (error) {
+    if (String(error?.message || "").toLowerCase().includes("duplicate key")) {
+      json(res, 409, { ok: false, error: "Username already exists." });
+      return;
+    }
+    throw error;
+  }
+}
+
+async function handleAdminUserUpdate(req, res, username, session) {
+  const rawBody = await readBody(req);
+  let body;
+  try {
+    body = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    json(res, 400, { ok: false, error: "Invalid JSON payload" });
+    return;
+  }
+
+  const hasIsActive = typeof body?.isActive === "boolean";
+  const hasRequireChangePw = typeof body?.requireChangePw === "boolean";
+  if (!hasIsActive && !hasRequireChangePw) {
+    json(res, 400, { ok: false, error: "At least one update flag is required." });
+    return;
+  }
+  if (username === session.username && hasIsActive && body.isActive === false) {
+    json(res, 400, { ok: false, error: "You cannot deactivate your own account." });
+    return;
+  }
+  if (ADMIN_EDIT_PROTECTED_USERNAMES.has(username)) {
+    json(res, 400, { ok: false, error: "This user cannot be modified." });
+    return;
+  }
+
+  const updates = [];
+  const values = [];
+  if (hasIsActive) {
+    values.push(body.isActive);
+    updates.push(`is_active = $${values.length}`);
+  }
+  if (hasRequireChangePw) {
+    values.push(body.requireChangePw);
+    updates.push(`require_changepw = $${values.length}`);
+  }
+  values.push(username);
+
+  const result = await dbQuery(
+    `UPDATE users
+     SET ${updates.join(", ")},
+         updated_at = NOW()
+     WHERE username = $${values.length}
+     RETURNING username, is_active, require_changepw`,
+    values
+  );
+  const updatedUser = result.rows[0];
+  if (!updatedUser) {
+    json(res, 404, { ok: false, error: "User does not exist." });
+    return;
+  }
+
+  json(res, 200, {
+    ok: true,
+    user: {
+      username: updatedUser.username,
+      isActive: Boolean(updatedUser.is_active),
+      requireChangePw: Boolean(updatedUser.require_changepw),
+    },
+  });
+}
+
+async function handleAdminUserDelete(res, username, session) {
+  if (username === session.username) {
+    json(res, 400, { ok: false, error: "You cannot delete your own account." });
+    return;
+  }
+  if (ADMIN_EDIT_PROTECTED_USERNAMES.has(username)) {
+    json(res, 400, { ok: false, error: "This user cannot be deleted." });
+    return;
+  }
+
+  const result = await dbQuery(
+    `DELETE FROM users
+     WHERE username = $1
+     RETURNING id, username`,
+    [username]
+  );
+  const deletedUser = result.rows[0];
+  if (!deletedUser) {
+    json(res, 404, { ok: false, error: "User does not exist." });
+    return;
+  }
+
+  await dbQuery("DELETE FROM sessions WHERE user_id = $1", [deletedUser.id]);
+  json(res, 200, { ok: true, deleted: true, username: deletedUser.username });
+}
+
+async function requireValidatedSession(req, res, url, { body = null, refresh = true } = {}) {
+  const validatedSession = await validateAndRefreshSession({ req, url, body, refresh });
+  if (!validatedSession.ok) {
+    json(res, validatedSession.statusCode || 401, { ok: false, error: validatedSession.error });
+    return null;
+  }
+  return validatedSession.session;
+}
+
+const handleRequest = createBackendRequestHandler({
+  json,
+  handleLogin,
+  handleChangePassword,
+  handleSession,
+  handleLogout,
+  handleAdminUsersList,
+  handleAdminUserCreate,
+  handleAdminUserUpdate,
+  handleAdminUserDelete,
+  handleStatus,
+  handleLibraryList,
+  handleLibraryUpload,
+  handleLibraryDelete,
+  handleLibraryToggle,
+  handleChatInputTranscription,
+  handlePromptWithUserAttachments,
+  getDbHealth,
+  isAdminSession,
+  requireValidatedSession,
+  proxyRetriever,
+  retrieverBaseUrl: RETRIEVER_BASE_URL,
+  embedderBaseUrl: EMBEDDER_BASE_URL,
+});
+
+const server = http.createServer(async (req, res) => {
+  try {
+    await handleRequest(req, res);
+  } catch (error) {
+    if (error.message === "Payload too large") {
+      json(res, 413, {
+        error: error.message,
+      });
+      return;
+    }
+
+    json(res, 502, {
+      error: "Upstream request failed",
+      details: error.message,
+    });
+  }
+});
+
+await ensureDatabaseReady();
+const syncedUsers = await syncUsersFromConfigFile();
+console.log(`[backend] synced users from ${syncedUsers.filePath} (configured: ${syncedUsers.configured})`);
+
+server.listen(PORT, HOST, () => {
+  console.log(`Backend API listening on http://${HOST}:${PORT}`);
+  console.log("Endpoints: POST /api/auth/login, POST /api/auth/change-password, GET /api/auth/session, POST /api/auth/logout, GET|POST /api/admin/users, PATCH|DELETE /api/admin/users/:username, GET /api/status, GET /api/files, PATCH /api/files/tags, GET|PATCH /api/files/tag-filters, GET|POST /api/chats, PATCH|DELETE /api/chats/:chatId, GET /api/chats/:chatId/download, GET /api/messages, GET|PATCH /api/personalization, GET|POST|PATCH|DELETE /api/library/files, POST /api/prompt, POST /api/transcription/chat-input");
+});
