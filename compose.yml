@@ -13,7 +13,9 @@ x-node-service: &node-service
 
 services:
   backend:
-    <<: *node-service
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
     environment:
       APP_ROLE: backend
       BACKEND_API_PORT: 3100
